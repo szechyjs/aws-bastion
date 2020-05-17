@@ -384,7 +384,7 @@ Resources:
           CONTAINER_NAME: bastion
           TASK_FAMILY: bastions
       Timeout: 120
-      Code: /Users/jared/code/bastion/lambda
+      Code: ./../lambda
 
   CreatePermission:
     Type: AWS::Lambda::Permission
@@ -417,7 +417,7 @@ Resources:
         TargetArn: !GetAtt
           - DeadLetterQueue
           - Arn
-      Code: /Users/jared/code/bastion/lambda
+      Code: ./../lambda
 
   TriggerDestructionLambda:
     Type: AWS::Lambda::Function
@@ -432,7 +432,7 @@ Resources:
       Environment:
         Variables:
           DESTROY_BASTION_FUNCTION_NAME: destroy-bastion
-      Code: /Users/jared/code/bastion/lambda
+      Code: ./../lambda
 
   TriggerDestructionPermission:
     Type: AWS::Lambda::Permission
