@@ -1,0 +1,453 @@
+Parameters:
+  ClusterVpcID:
+    Description: Cluster VPC
+    Type: AWS::EC2::VPC::Id
+  ClusterDefaultSg:
+    Description: VPC default security group
+    Type: AWS::EC2::SecurityGroup::Id
+  ClusterSubnets:
+    Description: Cluster subnet IDs
+    Type: List<AWS::EC2::Subnet::Id>
+Resources:
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: bastion
+      RetentionInDays: 7
+
+  ContainerRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: bastion
+
+  ApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: Bastion Management
+
+  ApiGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - PostBastionMethod
+      - DeleteBastionMethod
+    Properties:
+      RestApiId: !Ref ApiGateway
+      StageName: demo
+      StageDescription:
+        MetricsEnabled: true
+        LoggingLevel: INFO
+        DataTraceEnabled: true
+
+  ApiGatewayResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      PathPart: bastion
+      ParentId: !GetAtt
+        - ApiGateway
+        - RootResourceId
+
+  ApiGatewayModel:
+    Type: AWS::ApiGateway::Model
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ContentType: application/json
+      Name: Bastion
+      Schema:
+        $schema: 'http://json-schema.org/draft-04/schema#'
+        title: Bastion
+        type: object
+        additionalProperties: false
+        properties:
+          ip:
+            type: string
+        required:
+          - ip
+
+  PostBastionMethod:
+    Type: AWS::ApiGateway::Method
+    DependsOn: ApiGatewayModel
+    Properties:
+      HttpMethod: POST
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref ApiGatewayResource
+      AuthorizationType: AWS_IAM
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${lambdaArn}/invocations"
+          - lambdaArn: !GetAtt
+            - CreateLambda
+            - Arn
+      MethodResponses:
+        - ResponseModels:
+            application/json: Bastion
+          StatusCode: '201'
+
+  DeleteBastionMethod:
+    Type: AWS::ApiGateway::Method
+    DependsOn: ApiGatewayModel
+    Properties:
+      HttpMethod: DELETE
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref ApiGatewayResource
+      AuthorizationType: AWS_IAM
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${lambdaArn}/invocations"
+          - lambdaArn: !GetAtt
+            - TriggerDestructionLambda
+            - Arn
+      MethodResponses:
+        - ResponseModels:
+            application/json: Empty
+          StatusCode: '200'
+
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: bastion
+
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs-tasks.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: bastion-execution
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                Resource: !GetAtt
+                  - ContainerRepository
+                  - Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  PublicKeyFetcherRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action:
+              - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: public-key-fetcher
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - iam:ListSSHPublicKeys
+                  - iam:GetSSHPublicKey
+                Resource: !Sub "arn:aws:iam::${AWS::AccountId}:user/*"
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs-tasks.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: bastion-task
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sts:AssumeRole
+                Resource: !GetAtt 
+                  - PublicKeyFetcherRole
+                  - Arn
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Cpu: '256'
+      Memory: '512'
+      NetworkMode: awsvpc
+      Family: bastions
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !GetAtt
+        - TaskExecutionRole
+        - Arn
+      TaskRoleArn: !GetAtt
+        - TaskRole
+        - Arn
+      ContainerDefinitions:
+        - Name: bastion
+          Image: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/bastion:latest"
+          PortMappings:
+            - ContainerPort: 22
+          Environment:
+            - Name: ASSUME_ROLE_FOR_AUTHORIZED_KEYS
+              Value: !GetAtt
+                - PublicKeyFetcherRole
+                - Arn
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: bastion
+              awslogs-region: !Sub "${AWS::Region}"
+              awslogs-stream-prefix: ssh
+
+  CreateBastionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: create-bastion
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/create-bastion"
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/create-bastion:*"
+              - Effect: Allow
+                Action:
+                  - ec2:AuthorizeSecurityGroupIngress
+                  - ec2:CreateSecurityGroup
+                  - ec2:DeleteSecurityGroup
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:DescribeSecurityGroups
+                  - ec2:RevokeSecurityGroupIngress
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ecs:DescribeTask*
+                  - ecs:ListTask*
+                  - ecs:RunTask
+                  - ecs:StopTask
+                Resource: '*'
+                Condition:
+                  ArnEquals:
+                    ecs:cluster: !GetAtt
+                      - EcsCluster
+                      - Arn
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource:
+                  - !GetAtt 
+                    - TaskExecutionRole
+                    - Arn
+                  - !GetAtt
+                    - TaskRole
+                    - Arn
+                Condition:
+                  StringLike:
+                    iam:PassedToService: ecs-tasks.amazonaws.com
+  
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: destroy-bastion-dlq
+  
+  DestroyBastionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: destroy-bastion
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/destroy-bastion"
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/destroy-bastion:*"
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt
+                  - DeadLetterQueue
+                  - Arn
+              - Effect: Allow
+                Action:
+                  - ec2:DeleteSecurityGroup
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:DescribeSecurityGroups
+                  - ec2:RevokeSecurityGroupIngress
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ecs:DescribeTasks
+                  - ecs:ListTasks
+                  - ecs:StopTask
+                Resource: '*'
+                Condition:
+                  ArnEquals:
+                    ecs:cluster: !GetAtt
+                      - EcsCluster
+                      - Arn
+
+  TriggerDestructionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: trigger-bastion-destruction
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/trigger-bastion-destruction"
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/trigger-bastion-destruction:*"
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: '*' # !GetAtt destroy_bastion_function_arn
+
+  CreateLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: create-bastion
+      Handler: create.handler
+      MemorySize: 256
+      Role: !GetAtt
+        - CreateBastionRole
+        - Arn
+      Runtime: ruby2.7
+      Environment:
+        Variables:
+          CLUSTER_NAME: bastion
+          CLUSTER_SUBNET_IDS: !Join
+            - ','
+            - !Ref ClusterSubnets
+          CLUSTER_VPC_DEFAULT_SECURITY_GROUP_ID: !Ref ClusterDefaultSg
+          CLUSTER_VPC_ID: !Ref ClusterVpcID
+          CONTAINER_NAME: bastion
+          TASK_FAMILY: bastions
+      Timeout: 120
+      Code: /Users/jared/code/bastion/lambda
+
+  CreatePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt
+        - CreateLambda
+        - Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*/POST/bastion"
+
+
+  DestroyLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: destroy-bastion
+      Handler: destroy.handler
+      MemorySize: 256
+      Role: !GetAtt
+        - DestroyBastionRole
+        - Arn
+      Runtime: ruby2.7
+      Environment:
+        Variables:
+          CLUSTER_NAME: bastion
+          CLUSTER_VPC_DEFAULT_SECURITY_GROUP_ID: !Ref ClusterDefaultSg
+          CLUSTER_VPC_ID: !Ref ClusterVpcID
+      Timeout: 120
+      DeadLetterConfig:
+        TargetArn: !GetAtt
+          - DeadLetterQueue
+          - Arn
+      Code: /Users/jared/code/bastion/lambda
+
+  TriggerDestructionLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: trigger-bastion-destruction
+      Handler: trigger-bastion-destruction.handler
+      MemorySize: 128
+      Role: !GetAtt
+        - TriggerDestructionRole
+        - Arn
+      Runtime: ruby2.7
+      Environment:
+        Variables:
+          DESTROY_BASTION_FUNCTION_NAME: destroy-bastion
+      Code: /Users/jared/code/bastion/lambda
+
+  TriggerDestructionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt
+        - TriggerDestructionLambda
+        - Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*/DELETE/bastion"
+
+Outputs:
+  ApiUrl: 
+    Description: The API URL for creating and destroying bastions
+    Value: !Sub
+    - "https://${apiID}.execute-api.${AWS::Region}.amazonaws.com/demo/bastion"
+    - apiID: !Ref ApiGateway
+

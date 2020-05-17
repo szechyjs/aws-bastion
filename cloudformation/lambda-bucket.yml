@@ -1,0 +1,5 @@
+Resources:
+  LambdaZipBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: bastion-lambdas
